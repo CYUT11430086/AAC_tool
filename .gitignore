@@ -1,0 +1,14 @@
+# Python 暫存與虛擬環境
+__pycache__/
+*.pyc
+.venv/
+
+# 本專案下載的打包工具與產物
+.builddeps/
+build/
+dist/
+*.spec
+
+# 本機設定與密鑰
+.env
+.env.*
