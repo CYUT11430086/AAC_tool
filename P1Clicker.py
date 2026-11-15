@@ -1,6 +1,12 @@
 import ctypes as ct
 from ctypes import wintypes as wt
 import os
+import subprocess
+import shutil
+import struct
+from threading import Event
+from io import BytesIO
+from tkinter import filedialog
 from pathlib import Path
 import sys
 import random
@@ -12,7 +18,7 @@ from tkinter import ttk
 
 import cv2
 import numpy as np
-from PIL import Image, ImageGrab, ImageTk
+from PIL import Image, ImageDraw, ImageGrab, ImageTk
 
 u = ct.windll.user32
 try:
@@ -39,6 +45,26 @@ rx, ry, rw, rh, _ = stats[orb_id]
 silhouette = labels[ry:ry + rh, rx:rx + rw] == orb_id
 
 
+# The caption below P1 distinguishes the orb from other cyan game effects.
+caption = np.asarray(reference.convert("L").crop((63, 190, 168, 220)))
+
+
+def has_orb_caption(frame, x, y, w, h):
+    scale = h / rh
+    cx = x + w / 2
+    bottom = y + h
+    region = frame.crop((int(cx - w * .75), int(bottom - h * .08),
+                         int(cx + w * .75), int(bottom + h * .33))).convert("L")
+    gray = np.asarray(region)
+    for factor in (.9, 1.0, 1.1):
+        template = cv2.resize(caption, None, fx=scale * factor, fy=scale * factor)
+        if min(template.shape) < 4 or any(a > b for a, b in zip(template.shape, gray.shape)):
+            continue
+        if cv2.minMaxLoc(cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED))[1] >= .60:
+            return True
+    return False
+
+
 def bounds(hwnd):
     rect, origin = wt.RECT(), wt.POINT()
     if not u.GetClientRect(hwnd, ct.byref(rect)) or not u.ClientToScreen(hwnd, ct.byref(origin)):
@@ -47,6 +73,12 @@ def bounds(hwnd):
 
 
 def match(frame):
+    # Use a 1080p analysis canvas and return coordinates in original device pixels.
+    width, height = frame.size
+    scale = min(1.0, 1920 / width, 1080 / height)
+    if scale < 1:
+        frame = frame.resize((max(1, round(width * scale)), max(1, round(height * scale))),
+                             Image.Resampling.BILINEAR)
     mask = orb_mask(frame)
     count, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
     best = None
@@ -57,9 +89,12 @@ def match(frame):
         candidate = (labels[y:y+h, x:x+w] == index).astype(np.uint8)
         aligned = cv2.resize(candidate, (rw, rh), interpolation=cv2.INTER_NEAREST) != 0
         score = np.count_nonzero(aligned & silhouette) / np.count_nonzero(aligned | silhouette)
-        if score >= 0.60 and (best is None or score > best[2]):
+        if score >= 0.60 and (best is None or score > best[2]) and has_orb_caption(frame, x, y, w, h):
             best = (x + w // 2, y + int(h * 0.78), score)
-    return best
+    if best is None:
+        return None
+    x, y, score = best
+    return round(x * width / frame.width), round(y * height / frame.height), score
 
 
 dwm = ct.windll.dwmapi
@@ -97,9 +132,128 @@ def windows():
 PREVIEW_PERIOD = 1 / 30
 
 
+def find_adb():
+    for drive in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+        candidate = Path(f"{drive}:/LDPlayer/LDPlayer9/adb.exe")
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which("adb.exe")
+
+
+def adb_command(path, *args):
+    try:
+        result = subprocess.run([path, *args], capture_output=True, timeout=5,
+                                creationflags=subprocess.CREATE_NO_WINDOW)
+    except subprocess.TimeoutExpired as error:
+        raise OSError("ADB 連線逾時") from error
+    if result.returncode:
+        raise OSError(result.stderr.decode("utf-8", "replace").strip() or "ADB 指令失敗")
+    return result.stdout
+
+
+def device_frame(target):
+    path, serial = target
+    args = (path, "-s", serial, "exec-out", "screencap")
+    raw = adb_command(*args)
+    if len(raw) >= 12:
+        width, height, fmt = struct.unpack_from("<III", raw)
+        offset = len(raw) - width * height * 4
+        if fmt in (1, 2) and offset in (12, 16) and width and height:
+            return Image.frombytes("RGB", (width, height), raw[offset:], "raw", "RGBX")
+    data = adb_command(*args, "-p")
+    with Image.open(BytesIO(data)) as frame:
+        return frame.convert("RGB")
+
+
+def shop_template(name, crop):
+    image = Image.open(Path(__file__).with_name(name)).convert("L").resize((140, 48))
+    return np.asarray(image)[crop]
+
+
+SHOP_TEXT = (slice(8, 41), slice(26, 114))
+UPGRADE_TEXT = (slice(6, 42), slice(27, 62))
+SHOP_IMAGES = {
+    "store": shop_template("store.png", SHOP_TEXT),
+    "upgrade": shop_template("upgrade.png", UPGRADE_TEXT),
+}
+
+
+STORE_FACE = Image.open(Path(__file__).with_name("store.png")).convert("RGB").crop((5, 4, 135, 64))
+
+
+def locate_store(frame):
+    # Match the button face directly, even when its border touches the scenery.
+    ratio = min(1.0, 1000 / frame.width)
+    small = frame.resize((round(frame.width * ratio), round(frame.height * ratio)), Image.Resampling.BILINEAR)
+    rgb = np.asarray(small)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    best, point = .78, None
+    for width in range(32, 162, 2):
+        height = round(width * STORE_FACE.height / STORE_FACE.width)
+        if width > small.width or height > small.height:
+            continue
+        template = np.asarray(STORE_FACE.resize((width, height), Image.Resampling.BILINEAR))
+        scores = cv2.matchTemplate(gray, cv2.cvtColor(template, cv2.COLOR_RGB2GRAY), cv2.TM_CCOEFF_NORMED)
+        _, score, _, (x, y) = cv2.minMaxLoc(scores)
+        if score <= best:
+            continue
+        patch = rgb[y:y+height, x:x+width]
+        if np.abs(patch.astype(np.int16) - template).mean() < 34:
+            best = score
+            point = (round((x+width/2)*frame.width/small.width),
+                     round((y+height/2)*frame.height/small.height))
+    return point
+
+
+def shop_button(frame, kind):
+    rgb = np.asarray(frame)
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    store = kind == "store"
+    low, high = ((4, 90, 70), (30, 255, 255)) if store else ((38, 85, 65), (90, 255, 255))
+    mask = cv2.inRange(hsv, low, high)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best, point = .72, None
+    crop = SHOP_TEXT if store else UPGRADE_TEXT
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        ratio = w / h
+        if h < 12 or not ((1.6 < ratio < 2.7) if store else (3.0 < ratio < 5.2)):
+            continue
+        # Normalize the colored interior; allow a small margin for border variation.
+        patch = cv2.resize(rgb[y:y+h, x:x+w], (140, 48))
+        gray = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY)
+        rows, cols = crop
+        search = gray[rows.start-5:rows.stop+5, cols.start-6:cols.stop+6]
+        score = cv2.minMaxLoc(cv2.matchTemplate(search, SHOP_IMAGES[kind], cv2.TM_CCOEFF_NORMED))[1]
+        if score > best:
+            best, point = score, (x + w//2, y + h//2)
+    if store and point is None:
+        return locate_store(frame)
+    return point
+
+
+def inspect_shop(target, cancelled, stage):
+    if not cancelled.is_set():
+        frame = device_frame(target)
+        upgrade = shop_button(frame, "upgrade") if stage == "inside" else None
+        return upgrade, None if upgrade else shop_button(frame, "store")
+
+
+def device_observation(target, cancelled):
+    if not cancelled.is_set():
+        frame = device_frame(target)
+        return frame.size, match(frame)
+
+
+def device_tap(target, point, cancelled):
+    path, serial = target
+    if not cancelled.is_set():
+        adb_command(path, "-s", serial, "shell", "input", "tap", *map(str, point))
+
+
 def capture_preview(hwnd, size):
     try:
-        frame = ImageGrab.grab(window=hwnd)
+        frame = device_frame(hwnd) if isinstance(hwnd, tuple) else ImageGrab.grab(window=hwnd)
         frame.thumbnail(size, Image.Resampling.BILINEAR)
         return frame
     except (OSError, ValueError):
@@ -154,6 +308,8 @@ class App:
                                     style="Picker.TMenubutton", takefocus=True)
         self.menu = tk.Menu(self.combo, tearoff=False, postcommand=self.populate_menu)
         self.combo.configure(menu=self.menu)
+        self.adb_path = find_adb()
+        self.devices = []
         self.selection = None
         root.minsize(390, 1)
         self.combo.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 12))
@@ -167,6 +323,30 @@ class App:
                 widget.bind(event, self.press_animation, add="+")
         self.status = tk.StringVar()
         ttk.Label(panel, textvariable=self.status).grid(row=5, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        self.shop_enabled = tk.BooleanVar(value=False)
+        self.shop_stage = None
+        self.shop_owner = None
+        self.shop_due = float("inf")
+        self.switch_images = []
+        for enabled in (False, True):
+            icon = Image.new("RGBA", (40, 22))
+            draw = ImageDraw.Draw(icon)
+            draw.rounded_rectangle((1, 1, 39, 21), radius=10, fill="#087463" if enabled else "#627576")
+            x = 21 if enabled else 3
+            draw.ellipse((x, 3, x+16, 19), fill="white")
+            self.switch_images.append(ImageTk.PhotoImage(icon))
+        self.shop_switch = ttk.Checkbutton(panel, text="自動升級商店", compound="left",
+                                          variable=self.shop_enabled, command=self.toggle_shop)
+        self.shop_switch.configure(image=self.switch_images[0], style="Toolbutton")
+        self.shop_switch.grid(row=6, column=0, sticky="w")
+        self.shop_switch.grid_remove()
+        self.shop_interval = ttk.Combobox(panel, state="readonly", width=16,
+                                          values=[f"每 {n} 分鐘檢查" for n in range(1, 6)])
+        self.shop_interval.current(4)
+        self.shop_interval.grid(row=6, column=1, sticky="e")
+        self.shop_interval.grid_remove()
+        self.shop_interval.bind("<<ComboboxSelected>>", lambda _: self.toggle_shop())
+
         self.timer = None
         self.pending = None
         self.anchor = None
@@ -174,6 +354,7 @@ class App:
         self.preview_timer = None
         self.preview_job = None
         self.preview_key = None
+        self.cancelled = Event()
         self.preview_pool = ThreadPoolExecutor(max_workers=1)
         self.preview_image = None
         self.preview = ttk.Frame(panel, height=195, style="Preview.TFrame")
@@ -266,7 +447,18 @@ class App:
         self.update_preview()
 
     def update_selection_label(self):
-        title = next((name for name, hwnd in self.choices if hwnd == self.selection), "")
+        if self.shop_owner != self.selection:
+            self.shop_owner = self.selection
+            self.shop_stage = None
+            self.shop_enabled.set(False)
+            self.toggle_shop()
+        if isinstance(self.selection, tuple):
+            self.shop_switch.grid()
+            self.shop_interval.grid()
+        else:
+            self.shop_switch.grid_remove()
+            self.shop_interval.grid_remove()
+        title = next((name for name, hwnd in self.choices + self.devices if hwnd == self.selection), "")
         self.combo.configure(text=("  " + title) if title else "")
 
     def populate_menu(self):
@@ -275,9 +467,39 @@ class App:
         for name, hwnd in self.choices:
             self.menu.add_command(label=name, command=lambda h=hwnd: self.choose_window(h))
 
+        self.menu.add_separator()
+        self.menu.add_command(label="搜尋雷電 ADB 裝置", command=self.discover_devices)
+        for name, target in self.devices:
+            self.menu.add_command(label=name, command=lambda t=target: self.choose_window(t))
+
+    def discover_devices(self):
+        if not self.adb_path:
+            self.adb_path = filedialog.askopenfilename(title="選擇雷電安裝資料夾內的 adb.exe",
+                                                       filetypes=[("ADB", "adb.exe")])
+        if not self.adb_path:
+            return
+        try:
+            lines = adb_command(self.adb_path, "devices").decode().splitlines()
+        except OSError as error:
+            self.status.set(str(error))
+            return
+        self.devices = []
+        for line in lines:
+            fields = line.split()
+            if len(fields) == 2 and fields[1] == "device":
+                serial = fields[0]
+                if serial.startswith(("emulator-", "127.0.0.1:", "localhost:")):
+                    self.devices.append((f"ADB · {serial}", (self.adb_path, serial)))
+        if len(self.devices) == 1:
+            self.choose_window(self.devices[0][1])
+            self.status.set("已選取本機 ADB 裝置。")
+        else:
+            self.refresh()
+            self.status.set("請展開選單選擇 ADB 裝置。" if self.devices else "找不到裝置，請啟動雷電並開啟 ADB 本機連線。")
+
     def refresh(self):
         self.choices = windows()
-        if not any(hwnd == self.selection for _, hwnd in self.choices):
+        if not any(hwnd == self.selection for _, hwnd in self.choices + self.devices):
             self.selection = self.choices[0][1] if self.choices else None
         self.update_selection_label()
         self.update_preview()
@@ -291,6 +513,7 @@ class App:
         self.preview_note.configure(image="", text="無可用預覽")
 
     def close(self):
+        self.cancelled.set()
         self.release_preview()
         self.preview_pool.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
@@ -315,7 +538,7 @@ class App:
                 self.preview_note.configure(image=self.preview_image, text="")
             else:
                 self.preview_note.configure(image="", text="無可用預覽")
-        if not hwnd or not self.preview.winfo_ismapped() or not taskbar_window(hwnd):
+        if not hwnd or not self.preview.winfo_ismapped() or (not isinstance(hwnd, tuple) and not taskbar_window(hwnd)):
             self.release_preview()
             return
         if self.preview_job is None and min(size) > 1:
@@ -330,7 +553,7 @@ class App:
 
     def start(self):
         self.target = self.selected()
-        if not self.target or not taskbar_window(self.target):
+        if not self.target or (not isinstance(self.target, tuple) and not taskbar_window(self.target)):
             self.refresh()
             self.status.set("請重新選擇目標視窗。")
             return
@@ -340,10 +563,120 @@ class App:
         self.combo.configure(state="disabled")
         self.start_button.configure(state="disabled")
         self.pause_button.configure(state="normal")
-        if u.IsIconic(self.target):
-            u.ShowWindow(self.target, 9)
-        u.SetForegroundWindow(self.target)
-        self.scan()
+        if not isinstance(self.target, tuple):
+            if u.IsIconic(self.target):
+                u.ShowWindow(self.target, 9)
+            u.SetForegroundWindow(self.target)
+        if isinstance(self.target, tuple):
+            self.cancelled = Event()
+            self.device_missing = 0
+            self.device_size = None
+            self.device_scan()
+        else:
+            self.scan()
+
+    def toggle_shop(self):
+        enabled = self.shop_enabled.get()
+        self.shop_switch.configure(image=self.switch_images[int(enabled)])
+        self.shop_due = monotonic() + 60 * (1 + self.shop_interval.current()) if enabled else float("inf")
+
+    def shop_result(self, buttons):
+        upgrade, store = buttons
+        if self.shop_stage == "open" and not self.shop_enabled.get():
+            self.shop_stage = None
+            self.schedule_device_scan()
+            return
+        if self.shop_stage == "inside" and not self.shop_enabled.get():
+            self.shop_stage = "close"
+        if self.shop_stage == "inside" and not upgrade:
+            self.shop_empty += 1
+            if self.shop_empty >= 2:
+                self.shop_stage = "close"
+        if self.shop_stage == "inside":
+            point, after = upgrade, "inside"
+            if point:
+                self.shop_empty = 0
+        else:
+            point = store
+            after = "inside" if self.shop_stage == "open" else None
+        if not point:
+            if monotonic() >= self.shop_timeout:
+                if self.shop_stage == "open":
+                    self.shop_finished(None)
+                else:
+                    self.pause()
+                    self.status.set("無法確認商店按鈕，已暫停。請確認商店已關閉再開始。")
+                    self.shop_stage = None
+                    self.toggle_shop()
+                return
+            self.timer = self.root.after(400, self.device_scan)
+            return
+        self.shop_timeout = monotonic() + 12
+        self.shop_stage = after
+        job = self.preview_pool.submit(device_tap, self.target, point, self.cancelled)
+        self.await_device(job, lambda _: self.shop_finished(after))
+
+    def shop_finished(self, stage):
+        self.shop_stage = stage
+        if stage is None:
+            self.toggle_shop()
+        self.timer = self.root.after(850, self.device_scan)
+
+    def device_scan(self):
+        self.sample_started = monotonic()
+        if self.shop_stage is None and self.sample_started >= self.shop_due:
+            self.shop_stage = "open"
+            self.shop_empty = 0
+            self.shop_timeout = self.sample_started + 12
+        if self.shop_stage:
+            self.status.set("正在檢查商店升級…")
+            job = self.preview_pool.submit(inspect_shop, self.target, self.cancelled, self.shop_stage)
+            self.await_device(job, self.shop_result)
+            return
+        job = self.preview_pool.submit(device_observation, self.target, self.cancelled)
+        self.await_device(job, self.device_result)
+
+    def await_device(self, job, callback):
+        if self.cancelled.is_set():
+            return
+        if not job.done():
+            self.timer = self.root.after(5, self.await_device, job, callback)
+            return
+        try:
+            result = job.result()
+        except (OSError, ValueError, cv2.error) as error:
+            self.pause()
+            self.status.set(f"ADB 連線失敗：{error}")
+            return
+        callback(result)
+
+    def schedule_device_scan(self):
+        next_scan = self.sample_started + 0.15
+        self.timer = self.root.after(max(1, round(1000 * (next_scan - monotonic()))), self.device_scan)
+
+    def device_result(self, observation):
+        size, hit = observation
+        if size != self.device_size:
+            self.anchor = None
+            self.device_size = size
+        if hit is None:
+            self.device_missing += 1
+            if self.device_missing >= 2:
+                self.anchor = None
+        else:
+            self.device_missing = 0
+            if self.anchor is None:
+                self.anchor = hit[:2]
+                job = self.preview_pool.submit(device_tap, self.target, hit[:2], self.cancelled)
+                self.await_device(job, self.device_clicked)
+                return
+        self.status.set(f"ADB {size[0]} × {size[1]}，已點擊 {self.count} 次。")
+        self.schedule_device_scan()
+
+    def device_clicked(self, result):
+        self.count += 1
+        self.status.set(f"已點擊 {self.count} 次。")
+        self.schedule_device_scan()
 
     def clear_target(self):
         if self.pending is not None:
@@ -352,6 +685,7 @@ class App:
         self.anchor = None
 
     def pause(self):
+        self.cancelled.set()
         self.clear_target()
         if self.timer is not None:
             self.root.after_cancel(self.timer)
@@ -427,10 +761,10 @@ class App:
         if not self.move_owned(box, point):
             self.clear_target()
             return
-        if not retry:
-            self.first_point = x, y
         u.mouse_event(2, 0, 0, 0, 0)
         u.mouse_event(4, 0, 0, 0, 0)
+        if not retry:
+            self.first_point = x, y
         self.count += 1
         if not retry:
             self.pending = self.root.after(500, self.click, True)
