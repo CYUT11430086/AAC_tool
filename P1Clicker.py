@@ -65,6 +65,29 @@ def has_orb_caption(frame, x, y, w, h):
     return False
 
 
+def caption_only(frame):
+    gray = np.asarray(frame.convert("L"))
+    if min(gray.shape) < 24:
+        return None
+    small = cv2.resize(gray, None, fx=.5, fy=.5, interpolation=cv2.INTER_AREA)
+    best = None
+    for scale in (.45, .55, .67, .80, .93, 1.0, 1.15, 1.35, 1.6, 1.9):
+        template = cv2.resize(caption, None, fx=scale, fy=scale)
+        h, w = template.shape
+        if h > gray.shape[0] or w > gray.shape[1]:
+            continue
+        tiny = cv2.resize(template, None, fx=.5, fy=.5, interpolation=cv2.INTER_AREA)
+        _, rough, _, (x, y) = cv2.minMaxLoc(cv2.matchTemplate(small, tiny, cv2.TM_CCOEFF_NORMED))
+        if rough < .55:
+            continue
+        left, top = max(0, 2*x-4), max(0, 2*y-4)
+        region = gray[top:2*y+h+5, left:2*x+w+5]
+        _, score, _, (dx, dy) = cv2.minMaxLoc(cv2.matchTemplate(region, template, cv2.TM_CCOEFF_NORMED))
+        if score >= .60 and (best is None or score > best[2]):
+            best = (left+dx+w//2, max(0, top+dy-round(h*1.4)), score)
+    return best
+
+
 def bounds(hwnd):
     rect, origin = wt.RECT(), wt.POINT()
     if not u.GetClientRect(hwnd, ct.byref(rect)) or not u.ClientToScreen(hwnd, ct.byref(origin)):
@@ -92,7 +115,9 @@ def match(frame):
         if score >= 0.60 and (best is None or score > best[2]) and has_orb_caption(frame, x, y, w, h):
             best = (x + w // 2, y + int(h * 0.78), score)
     if best is None:
-        return None
+        best = caption_only(frame)
+        if best is None:
+            return None
     x, y, score = best
     return round(x * width / frame.width), round(y * height / frame.height), score
 
@@ -149,6 +174,20 @@ def adb_command(path, *args):
     if result.returncode:
         raise OSError(result.stderr.decode("utf-8", "replace").strip() or "ADB 指令失敗")
     return result.stdout
+
+
+def wait_for_device(target, cancelled):
+    path, serial = target
+    delay = 1
+    while not cancelled.wait(delay):
+        try:
+            if serial.startswith(("127.0.0.1:", "localhost:")):
+                adb_command(path, "connect", serial)
+            if adb_command(path, "-s", serial, "get-state").strip() == b"device":
+                return
+        except OSError:
+            pass
+        delay = min(delay * 2, 8)
 
 
 def device_frame(target):
@@ -251,6 +290,30 @@ def device_tap(target, point, cancelled):
         adb_command(path, "-s", serial, "shell", "input", "tap", *map(str, point))
 
 
+class ThumbnailProperties(ct.Structure):
+    _fields_ = [("flags", wt.DWORD), ("destination", wt.RECT), ("source", wt.RECT),
+                ("opacity", wt.BYTE), ("visible", wt.BOOL), ("client_only", wt.BOOL)]
+
+
+def discover_adb(path):
+    lines = adb_command(path, "devices").decode().splitlines()
+    windows_by_device = {}
+    console = Path(path).with_name("ldconsole.exe")
+    if console.is_file():
+        try:
+            rows = adb_command(str(console), "list2").splitlines()
+            for row in rows:
+                fields = row.split(b",")
+                if len(fields) < 7 or fields[4] != b"1":
+                    continue
+                serial = adb_command(str(console), "adb", "--index", fields[0].decode(),
+                                     "--command", "get-serialno").decode().strip()
+                windows_by_device[(path, serial)] = int(fields[2])
+        except (ValueError, OSError):
+            pass
+    return lines, windows_by_device
+
+
 def capture_preview(hwnd, size):
     try:
         frame = device_frame(hwnd) if isinstance(hwnd, tuple) else ImageGrab.grab(window=hwnd)
@@ -293,7 +356,7 @@ class App:
         root.option_add("*Font", "{Microsoft JhengHei UI} 10")
         self.style = ttk.Style(root)
         self.style.theme_use("clam")
-        self.dark = tk.BooleanVar(value=False)
+        self.dark = tk.BooleanVar(value=True)
         panel = ttk.Frame(root, padding=(20, 16))
         panel.pack(fill="both", expand=True)
         panel.columnconfigure(0, weight=1, uniform="controls")
@@ -355,6 +418,10 @@ class App:
         self.preview_job = None
         self.preview_key = None
         self.cancelled = Event()
+        self.discovery_pool = ThreadPoolExecutor(max_workers=1)
+        self.discovery = None
+        self.adb_windows = {}
+        self.thumb = wt.HANDLE()
         self.preview_pool = ThreadPoolExecutor(max_workers=1)
         self.preview_image = None
         self.preview = ttk.Frame(panel, height=195, style="Preview.TFrame")
@@ -478,8 +545,21 @@ class App:
                                                        filetypes=[("ADB", "adb.exe")])
         if not self.adb_path:
             return
+        if self.discovery is not None:
+            return
+        self.status.set("搜尋雷電裝置中…")
+        self.discovery = self.discovery_pool.submit(discover_adb, self.adb_path)
+        self.finish_discovery()
+
+    def finish_discovery(self):
+        if not self.discovery.done():
+            self.root.after(30, self.finish_discovery)
+            return
+        job, self.discovery = self.discovery, None
+        if self.start_button.instate(["disabled"]):
+            return
         try:
-            lines = adb_command(self.adb_path, "devices").decode().splitlines()
+            lines, self.adb_windows = job.result()
         except OSError as error:
             self.status.set(str(error))
             return
@@ -504,7 +584,37 @@ class App:
         self.update_selection_label()
         self.update_preview()
 
+    def native_preview(self):
+        src = self.adb_windows.get(self.selected())
+        if not src or not u.IsWindow(src):
+            return False
+        dest = u.GetAncestor(self.root.winfo_id(), 2)
+        if dwm.DwmRegisterThumbnail(wt.HWND(dest), wt.HWND(src), ct.byref(self.thumb)):
+            return False
+        size, area = wt.SIZE(), wt.RECT()
+        child = self.preview.winfo_id()
+        u.GetClientRect(child, ct.byref(area))
+        u.MapWindowPoints(child, dest, ct.byref(area), 2)
+        if not dwm.DwmQueryThumbnailSourceSize(self.thumb, ct.byref(size)) and min(size.cx,size.cy)>0:
+            w,h = area.right-area.left, area.bottom-area.top
+            factor = min(w/size.cx,h/size.cy)
+            pw,ph = round(size.cx*factor),round(size.cy*factor)
+            x,y = area.left+(w-pw)//2,area.top+(h-ph)//2
+            props = ThumbnailProperties()
+            props.flags = 1|8|16
+            props.visible = props.client_only = True
+            props.destination = wt.RECT(x,y,x+pw,y+ph)
+            if not dwm.DwmUpdateThumbnailProperties(self.thumb, ct.byref(props)):
+                self.preview_note.configure(text="")
+                return True
+        dwm.DwmUnregisterThumbnail(self.thumb)
+        self.thumb = wt.HANDLE()
+        return False
+
     def release_preview(self):
+        if self.thumb.value:
+            dwm.DwmUnregisterThumbnail(self.thumb)
+            self.thumb = wt.HANDLE()
         if self.preview_timer is not None:
             self.root.after_cancel(self.preview_timer)
             self.preview_timer = None
@@ -515,6 +625,7 @@ class App:
     def close(self):
         self.cancelled.set()
         self.release_preview()
+        self.discovery_pool.shutdown(wait=False, cancel_futures=True)
         self.preview_pool.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
         for handle in self.window_icons:
@@ -522,7 +633,7 @@ class App:
 
     def update_preview(self, event=None):
         self.release_preview()
-        if self.preview.winfo_ismapped() and self.selected():
+        if self.preview.winfo_ismapped() and self.selected() and not self.native_preview():
             self.preview_tick(monotonic())
 
     def preview_tick(self, deadline):
@@ -614,7 +725,7 @@ class App:
         self.shop_timeout = monotonic() + 12
         self.shop_stage = after
         job = self.preview_pool.submit(device_tap, self.target, point, self.cancelled)
-        self.await_device(job, lambda _: self.shop_finished(after))
+        self.await_device(job, lambda _: self.shop_finished(after), tap=True)
 
     def shop_finished(self, stage):
         self.shop_stage = stage
@@ -636,19 +747,30 @@ class App:
         job = self.preview_pool.submit(device_observation, self.target, self.cancelled)
         self.await_device(job, self.device_result)
 
-    def await_device(self, job, callback):
+    def await_device(self, job, callback, tap=False):
         if self.cancelled.is_set():
             return
         if not job.done():
-            self.timer = self.root.after(5, self.await_device, job, callback)
+            self.timer = self.root.after(5, self.await_device, job, callback, tap)
             return
         try:
             result = job.result()
         except (OSError, ValueError, cv2.error) as error:
-            self.pause()
-            self.status.set(f"ADB 連線失敗：{error}")
+            if tap and (self.shop_stage or callback != self.device_clicked):
+                self.pause()
+                self.shop_stage = None
+                self.toggle_shop()
+                self.status.set("商店點擊結果未確認，請關閉商店後重新開始。")
+                return
+            self.status.set(f"等待 ADB 裝置重新連線：{self.target[1]}（可暫停）")
+            reconnect = self.preview_pool.submit(wait_for_device, self.target, self.cancelled)
+            self.await_device(reconnect, self.device_reconnected)
             return
         callback(result)
+
+    def device_reconnected(self, _):
+        self.shop_timeout = monotonic() + 12
+        self.device_scan()
 
     def schedule_device_scan(self):
         next_scan = self.sample_started + 0.15
@@ -668,7 +790,7 @@ class App:
             if self.anchor is None:
                 self.anchor = hit[:2]
                 job = self.preview_pool.submit(device_tap, self.target, hit[:2], self.cancelled)
-                self.await_device(job, self.device_clicked)
+                self.await_device(job, self.device_clicked, tap=True)
                 return
         self.status.set(f"ADB {size[0]} × {size[1]}，已點擊 {self.count} 次。")
         self.schedule_device_scan()
