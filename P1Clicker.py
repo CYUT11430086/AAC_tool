@@ -12,13 +12,14 @@ import sys
 import random
 from time import monotonic
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from math import ceil
 import tkinter as tk
 from tkinter import ttk
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageGrab, ImageTk
+from PIL import Image, ImageDraw, ImageGrab, ImageTk, ImageFont
 
 u = ct.windll.user32
 try:
@@ -49,6 +50,9 @@ silhouette = labels[ry:ry + rh, rx:rx + rw] == orb_id
 caption = np.asarray(reference.convert("L").crop((63, 190, 168, 220)))
 
 
+game_caption = np.asarray(Image.open(Path(__file__).with_name("P2-caption.png")).convert("L"))
+
+
 def has_orb_caption(frame, x, y, w, h):
     scale = h / rh
     cx = x + w / 2
@@ -65,14 +69,14 @@ def has_orb_caption(frame, x, y, w, h):
     return False
 
 
-def caption_only(frame):
+def caption_only(frame, sample=caption):
     gray = np.asarray(frame.convert("L"))
     if min(gray.shape) < 24:
         return None
     small = cv2.resize(gray, None, fx=.5, fy=.5, interpolation=cv2.INTER_AREA)
     best = None
-    for scale in (.45, .55, .67, .80, .93, 1.0, 1.15, 1.35, 1.6, 1.9):
-        template = cv2.resize(caption, None, fx=scale, fy=scale)
+    for scale in (.4, .45, .50, .55, .60, .65, .70, .75, .80, .86, .93, 1.0, 1.15, 1.35, 1.6, 1.9):
+        template = cv2.resize(sample, None, fx=scale, fy=scale)
         h, w = template.shape
         if h > gray.shape[0] or w > gray.shape[1]:
             continue
@@ -115,7 +119,7 @@ def match(frame):
         if score >= 0.60 and (best is None or score > best[2]) and has_orb_caption(frame, x, y, w, h):
             best = (x + w // 2, y + int(h * 0.78), score)
     if best is None:
-        best = caption_only(frame)
+        best = caption_only(frame, game_caption) or caption_only(frame)
         if best is None:
             return None
     x, y, score = best
@@ -244,6 +248,27 @@ def locate_store(frame):
     return point
 
 
+def upgrade_label(rgb, mask):
+    # Text is centered with a variable price; search the whole green row.
+    # Connected components also find buttons enclosed by other green UI.
+    _, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+    best, point = .70, None
+    template = SHOP_IMAGES["upgrade"]
+    for x, y, w, h, area in stats[1:]:
+        if h < 10 or not 2.3 <= w/h <= 7 or area < .48*w*h:
+            continue
+        row = cv2.cvtColor(rgb[y:y+h, x:x+w], cv2.COLOR_RGB2GRAY)
+        for factor in (.80, .90, 1.0, 1.10, 1.20):
+            scale = h / 48 * factor
+            word = cv2.resize(template, None, fx=scale, fy=scale)
+            if word.shape[0] > h or word.shape[1] > w:
+                continue
+            score = cv2.minMaxLoc(cv2.matchTemplate(row, word, cv2.TM_CCOEFF_NORMED))[1]
+            if score > best:
+                best, point = score, (int(x+w//2), int(y+h//2))
+    return point
+
+
 def shop_button(frame, kind):
     rgb = np.asarray(frame)
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
@@ -266,9 +291,142 @@ def shop_button(frame, kind):
         score = cv2.minMaxLoc(cv2.matchTemplate(search, SHOP_IMAGES[kind], cv2.TM_CCOEFF_NORMED))[1]
         if score > best:
             best, point = score, (x + w//2, y + h//2)
-    if store and point is None:
-        return locate_store(frame)
+    if point is None:
+        return locate_store(frame) if store else upgrade_label(rgb, mask)
     return point
+
+
+DJ_BANNER = Image.open(Path(__file__).with_name("Dj_up.png")).convert("RGB")
+DJ_ICON = np.asarray(DJ_BANNER.crop((5, 6, 93, 92)).convert("L"))
+DJ_ROW = np.asarray(Image.open(Path(__file__).with_name("Dj_P.png")).convert("RGB"))
+
+
+def light_letters(rgb):
+    rgb = rgb.astype(np.int16)
+    return ((rgb.min(axis=2) > 155) & (np.ptp(rgb, axis=2) < 40)).astype(np.uint8)
+
+
+def normalized_digit(mask):
+    x, y, w, h = cv2.boundingRect(mask)
+    return cv2.resize(mask[y:y+h, x:x+w].astype(np.float32), (22, 30))
+
+
+@lru_cache(maxsize=1)
+def digit_samples():
+    samples = [[] for _ in range(10)]
+    for name in ("arialbd.ttf", "segoeuib.ttf", "arial.ttf", "calibrib.ttf"):
+        try:
+            font = ImageFont.truetype(name, 40)
+        except OSError:
+            continue
+        for digit, group in enumerate(samples):
+            glyph = Image.new("L", (64, 64))
+            ImageDraw.Draw(glyph).text((4, 0), str(digit), fill=255, font=font)
+            group.append(normalized_digit((np.asarray(glyph) > 120).astype(np.uint8)))
+    for digit, left, right in ((3, 97, 112), (4, 115, 133)):
+        samples[digit].append(normalized_digit(light_letters(DJ_ROW[10:31, left:right])))
+    return samples
+
+
+def tribulation_rate(row):
+    # Align the fixed success-rate caption and percent sign around the full number.
+    mask = light_letters(row)
+    sample = light_letters(DJ_ROW)
+    label = sample[9:34, 13:87]
+    percent = sample[10:31, 135:158]
+    _, score, _, (x, y) = cv2.minMaxLoc(cv2.matchTemplate(mask, label, cv2.TM_CCOEFF_NORMED))
+    if score < .70:
+        return None
+    start = x + label.shape[1]
+    band = mask[max(0, y-2):y+26, start:start+102]
+    if band.shape[0] < 21 or band.shape[1] < 23:
+        return None
+    _, score, _, (end, top) = cv2.minMaxLoc(cv2.matchTemplate(band, percent, cv2.TM_CCOEFF_NORMED))
+    if score < .72 or not end:
+        return None
+    digits = band[top:top+21, :end]
+    # Isolated highlights between the caption and number are common on bright scenery.
+    _, components, stats, _ = cv2.connectedComponentsWithStats(digits)
+    keep = stats[:, cv2.CC_STAT_AREA] >= 8
+    keep[0] = False
+    digits = keep[components].astype(np.uint8)
+    runs = np.flatnonzero(np.diff(np.r_[0, digits.any(axis=0), 0])).reshape(-1, 2)
+    if not 1 <= len(runs) <= 3:
+        return None
+    value = 0
+    for left, right in runs:
+        glyph = digits[:, left:right]
+        if not 5 <= right-left <= 22 or cv2.boundingRect(glyph)[3] < 18:
+            return None
+        glyph = normalized_digit(glyph)
+        errors = [min((np.mean(np.abs(glyph-ref)) for ref in group), default=1)
+                  for group in digit_samples()]
+        first, second = np.argsort(errors)[:2]
+        if errors[first] > .27 or errors[second]-errors[first] < .035:
+            return None
+        value = 10 * value + int(first)
+    return value if value <= 100 else None
+
+
+def inspect_tribulation(target, cancelled):
+    if cancelled.is_set():
+        return None
+    frame = device_frame(target)
+    gray = np.asarray(frame.convert("L"))
+    best = .78
+    point = None
+    for scale in np.geomspace(.4, 2, 34):
+        if cancelled.is_set():
+            return None
+        icon = cv2.resize(DJ_ICON, None, fx=scale, fy=scale)
+        if any(a > b for a, b in zip(icon.shape, gray.shape)):
+            continue
+        _, score, _, (x, y) = cv2.minMaxLoc(cv2.matchTemplate(gray, icon, cv2.TM_CCOEFF_NORMED))
+        if score > best:
+            best = score
+            point = (x-5*scale, y-6*scale, scale)
+    if point:
+        x, y, scale = point
+        box = tuple(round(v) for v in (x+95*scale, y+49*scale, x+425*scale, y+92*scale))
+        row = np.asarray(frame.crop(box).resize((330, 43), Image.Resampling.BILINEAR))
+        rate = tribulation_rate(row)
+        if rate is not None:
+            return rate, (round(x+DJ_BANNER.width*scale/2), round(y+DJ_BANNER.height*scale/2))
+
+
+DJ_DIALOG_TITLE = np.asarray(Image.open(Path(__file__).with_name("Dj_2up.png"))
+                             .convert("L").crop((222, 7, 352, 55)))
+DJ_CONFIRM_FACE = np.asarray(Image.open(Path(__file__).with_name("Dj_2_c.png"))
+                             .convert("L").crop((7, 6, 264, 77)))
+
+
+def find_dj_confirm(frame):
+    rgb = np.asarray(frame)
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    green = cv2.inRange(hsv, (55, 90, 55), (90, 255, 255))
+    contours, _ = cv2.findContours(green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True):
+        x, y, w, h = cv2.boundingRect(contour)
+        if h < 18 or not 3.2 < w/h < 4.1:
+            continue
+        face = cv2.resize(gray[y:y+h, x:x+w], (257, 71))
+        if cv2.matchTemplate(face, DJ_CONFIRM_FACE, cv2.TM_CCOEFF_NORMED).item() < .78:
+            continue
+        # Search for the fixed dialog heading above this particular button.
+        scale = w / 257
+        title = cv2.resize(DJ_DIALOG_TITLE, None, fx=scale, fy=scale)
+        region = gray[max(0, y-round(225*scale)):max(0, y-round(95*scale)),
+                      max(0, x+round(150*scale)):x+round(395*scale)]
+        if any(a < b for a, b in zip(region.shape, title.shape)):
+            continue
+        if cv2.minMaxLoc(cv2.matchTemplate(region, title, cv2.TM_CCOEFF_NORMED))[1] >= .75:
+            return x+w//2, y+h//2
+
+
+def inspect_dj_confirm(target, cancelled):
+    if not cancelled.is_set():
+        return find_dj_confirm(device_frame(target))
 
 
 def inspect_shop(target, cancelled, stage):
@@ -391,11 +549,13 @@ class App:
         self.shop_owner = None
         self.shop_due = float("inf")
         self.switch_images = []
-        for enabled in (False, True):
+        self.switch_positions = {}
+        self.switch_timers = {}
+        for step in range(9):
             icon = Image.new("RGBA", (40, 22))
             draw = ImageDraw.Draw(icon)
-            draw.rounded_rectangle((1, 1, 39, 21), radius=10, fill="#087463" if enabled else "#627576")
-            x = 21 if enabled else 3
+            draw.rounded_rectangle((1, 1, 39, 21), radius=10, fill=tuple(round(a + (b-a)*step/8) for a, b in zip((98,117,118), (8,116,99))))
+            x = 3 + round(18*step/8)
             draw.ellipse((x, 3, x+16, 19), fill="white")
             self.switch_images.append(ImageTk.PhotoImage(icon))
         self.shop_switch = ttk.Checkbutton(panel, text="自動升級商店", compound="left",
@@ -410,7 +570,32 @@ class App:
         self.shop_interval.grid_remove()
         self.shop_interval.bind("<<ComboboxSelected>>", lambda _: self.toggle_shop())
 
+        self.dj_enabled = tk.BooleanVar(value=False)
+        self.dj_due = float("inf")
+        self.dj_switch = ttk.Checkbutton(panel, text="自動渡劫", compound="left",
+                                         variable=self.dj_enabled, command=self.toggle_dj,
+                                         image=self.switch_images[0], style="Toolbutton")
+        self.adb_separator = ttk.Separator(panel, orient="horizontal")
+        self.adb_separator.grid(row=7, columnspan=2, sticky="ew", pady=6)
+        self.adb_separator.grid_remove()
+        self.dj_switch.grid(row=8, column=0, sticky="w")
+        self.dj_switch.grid_remove()
+
+        self.dj_options = ttk.Frame(panel)
+        self.dj_options.grid(row=8, column=1, sticky="e")
+        self.dj_options.grid_remove()
+        self.dj_threshold = ttk.Combobox(self.dj_options, state="readonly", width=11,
+            values=[f"高於 {n}%" for n in range(50, 100, 10)] + ["僅限 100%"])
+        self.dj_threshold.current(2)
+        self.dj_threshold.pack(anchor="e")
+        self.dj_interval = ttk.Combobox(self.dj_options, state="readonly", width=16,
+            values=self.shop_interval.cget("values"))
+        self.dj_interval.current(0)
+        self.dj_interval.pack(anchor="e", pady=(3, 0))
+        self.dj_interval.bind("<<ComboboxSelected>>", lambda _: self.toggle_dj())
+
         self.timer = None
+        self.release_timer = None
         self.pending = None
         self.anchor = None
         self.choices = []
@@ -515,14 +700,22 @@ class App:
 
     def update_selection_label(self):
         if self.shop_owner != self.selection:
+            self.dj_enabled.set(False)
+            self.toggle_dj()
             self.shop_owner = self.selection
             self.shop_stage = None
             self.shop_enabled.set(False)
             self.toggle_shop()
         if isinstance(self.selection, tuple):
+            self.adb_separator.grid()
+            self.dj_options.grid()
+            self.dj_switch.grid()
             self.shop_switch.grid()
             self.shop_interval.grid()
         else:
+            self.adb_separator.grid_remove()
+            self.dj_options.grid_remove()
+            self.dj_switch.grid_remove()
             self.shop_switch.grid_remove()
             self.shop_interval.grid_remove()
         title = next((name for name, hwnd in self.choices + self.devices if hwnd == self.selection), "")
@@ -585,7 +778,8 @@ class App:
         self.update_preview()
 
     def native_preview(self):
-        src = self.adb_windows.get(self.selected())
+        target = self.selected()
+        src = self.adb_windows.get(target) if isinstance(target, tuple) else target
         if not src or not u.IsWindow(src):
             return False
         dest = u.GetAncestor(self.root.winfo_id(), 2)
@@ -623,6 +817,7 @@ class App:
         self.preview_note.configure(image="", text="無可用預覽")
 
     def close(self):
+        self.release_mouse()
         self.cancelled.set()
         self.release_preview()
         self.discovery_pool.shutdown(wait=False, cancel_futures=True)
@@ -677,6 +872,7 @@ class App:
         if not isinstance(self.target, tuple):
             if u.IsIconic(self.target):
                 u.ShowWindow(self.target, 9)
+            self.root.update_idletasks()
             u.SetForegroundWindow(self.target)
         if isinstance(self.target, tuple):
             self.cancelled = Event()
@@ -686,9 +882,58 @@ class App:
         else:
             self.scan()
 
+    def animate_switch(self, widget, enabled):
+        timer = self.switch_timers.pop(widget, None)
+        if timer is not None:
+            self.root.after_cancel(timer)
+        position = self.switch_positions.get(widget, 0)
+        goal = len(self.switch_images)-1 if enabled else 0
+        if position != goal:
+            position += 1 if enabled else -1
+            self.switch_positions[widget] = position
+            widget.configure(image=self.switch_images[position])
+            if position != goal:
+                self.switch_timers[widget] = self.root.after(16, self.animate_switch, widget, enabled)
+
+    def toggle_dj(self):
+        enabled = self.dj_enabled.get()
+        self.animate_switch(self.dj_switch, enabled)
+        self.dj_due = monotonic() + 60 * (1 + self.dj_interval.current()) if enabled else float("inf")
+
+    def dj_result(self, observation):
+        threshold = 50 + 10 * self.dj_threshold.current()
+        if observation and self.dj_enabled.get() and observation[0] >= min(threshold + 1, 100):
+            _, point = observation
+            job = self.preview_pool.submit(device_tap, self.target, point, self.cancelled)
+            self.await_device(job, self.dj_opened, tap=True)
+        else:
+            self.schedule_device_scan()
+
+    def dj_opened(self, _):
+        self.count += 1
+        self.dj_confirm_until = monotonic() + 5
+        self.check_dj_confirm()
+
+    def check_dj_confirm(self):
+        if not self.dj_enabled.get() or monotonic() >= self.dj_confirm_until:
+            self.schedule_device_scan()
+            return
+        self.status.set("正在確認渡劫視窗…")
+        job = self.preview_pool.submit(inspect_dj_confirm, self.target, self.cancelled)
+        self.await_device(job, self.dj_confirm_result)
+
+    def dj_confirm_result(self, point):
+        if not self.dj_enabled.get():
+            self.schedule_device_scan()
+        elif point:
+            job = self.preview_pool.submit(device_tap, self.target, point, self.cancelled)
+            self.await_device(job, self.device_clicked, tap=True)
+        else:
+            self.timer = self.root.after(250, self.check_dj_confirm)
+
     def toggle_shop(self):
         enabled = self.shop_enabled.get()
-        self.shop_switch.configure(image=self.switch_images[int(enabled)])
+        self.animate_switch(self.shop_switch, enabled)
         self.shop_due = monotonic() + 60 * (1 + self.shop_interval.current()) if enabled else float("inf")
 
     def shop_result(self, buttons):
@@ -744,6 +989,12 @@ class App:
             job = self.preview_pool.submit(inspect_shop, self.target, self.cancelled, self.shop_stage)
             self.await_device(job, self.shop_result)
             return
+        if self.sample_started >= self.dj_due:
+            self.dj_due = self.sample_started + 60 * (1 + self.dj_interval.current())
+            self.status.set("正在檢查渡劫成功率…")
+            job = self.preview_pool.submit(inspect_tribulation, self.target, self.cancelled)
+            self.await_device(job, self.dj_result)
+            return
         job = self.preview_pool.submit(device_observation, self.target, self.cancelled)
         self.await_device(job, self.device_result)
 
@@ -756,7 +1007,7 @@ class App:
         try:
             result = job.result()
         except (OSError, ValueError, cv2.error) as error:
-            if tap and (self.shop_stage or callback != self.device_clicked):
+            if tap and (self.shop_stage or callback not in (self.device_clicked, self.dj_opened)):
                 self.pause()
                 self.shop_stage = None
                 self.toggle_shop()
@@ -807,6 +1058,7 @@ class App:
         self.anchor = None
 
     def pause(self):
+        self.release_mouse()
         self.cancelled.set()
         self.clear_target()
         if self.timer is not None:
@@ -838,6 +1090,9 @@ class App:
         ) <= 24
 
     def scan(self):
+        if self.release_timer is not None:
+            self.timer = self.root.after(100, self.scan)
+            return
         started = monotonic()
         self.timer = None
         if not u.IsWindow(self.target):
@@ -854,9 +1109,9 @@ class App:
             self.clear_target()
             if hit is not None:
                 self.anchor = hit[:2]
-                self.pending = self.root.after(random.randint(1500, 2500), self.click, False)
+                self.pending = self.root.after(random.randint(500, 800), self.click, False)
         if box is None:
-            self.status.set("等待目標視窗回到前景…")
+            self.status.set("請點一下目標視窗，回到前景後會自動辨識。")
         else:
             self.status.set(f"辨識中，已點擊 {self.count} 次。")
         self.timer = self.root.after(max(1, round(800 - (monotonic() - started) * 1000)), self.scan)
@@ -884,9 +1139,18 @@ class App:
             self.clear_target()
             return
         u.mouse_event(2, 0, 0, 0, 0)
-        u.mouse_event(4, 0, 0, 0, 0)
+        self.release_timer = self.root.after(805, self.finish_hold, retry, score)
         if not retry:
             self.first_point = x, y
+
+    def release_mouse(self):
+        if self.release_timer is not None:
+            self.root.after_cancel(self.release_timer)
+            self.release_timer = None
+            u.mouse_event(4, 0, 0, 0, 0)
+
+    def finish_hold(self, retry, score):
+        self.release_mouse()
         self.count += 1
         if not retry:
             self.pending = self.root.after(500, self.click, True)
