@@ -17,7 +17,7 @@ from threading import Event, Thread
 from queue import Empty, Queue
 from urllib.request import Request, urlopen
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 REPO = "CYUT11430086/AAC_tool"
 API = f"https://api.github.com/repos/{REPO}/releases/latest"
 SEMVER = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
@@ -254,6 +254,7 @@ def start_release(root, open_app):
     messages = Queue()
     cancelled = Event()
     root.title("修仙祕笈")
+    root.iconbitmap(str(Path(__file__).with_name("P1Clicker.ico")))
     bg, ink, muted = "#152126", "#edf5f3", "#a5bab9"
     panel = tk.Frame(root, bg=bg, padx=24, pady=20)
     panel.pack(fill="both", expand=True)

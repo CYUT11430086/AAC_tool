@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 64 64"><title>修仙祕笈 · 線裝武功祕笈</title>
+ <defs><linearGradient id="cover" x2="100%" y2="100%"><stop stop-color="#32696b"/><stop offset="1" stop-color="#153c46"/></linearGradient></defs>
+ <g transform="rotate(-6 32 32)">
+ <path d="M9 5h43q4 0 4 4v48q0 3-4 3H10q-4 0-4-4V10q0-5 3-5z" fill="#162e33"/>
+ <path d="M10 52h43v5H11q-4 0-4-2t3-3z" fill="#edcf93"/>
+ <path d="M39 53h7v10l-3.5-2-3.5 2z" fill="#b34c38"/>
+ <rect x="6" y="4" width="48" height="50" rx="2.8" fill="url(#cover)" stroke="#102f38" stroke-width="1.3"/>
+ <path d="M13 5v48" stroke="#102f38" stroke-width="1.6"/>
+ <rect x="33" y="8" width="16" height="38" rx=".8" fill="#f8e6ba"/>
+ <g stroke-width="1.05"><g fill="none" stroke="#32281f" stroke-linecap="round" stroke-linejoin="round">
+ <path d="M36 12h4m-5 4h10m-8 3v5m3-6v5m0-3h2m-7 5 7-2m0-12q0 10 4 14l1-3m-3-10 2 1"/>
+ <path d="M35 31h5m-2 0v8m-4 2 7-3m-1-4h6l-1 8-3 1m1-14q0 10-5 14"/>
+ </g></g>
+ <path d="M17 47q6-9 10-10l2 3 5-5m-16 15 6-7 2 2 3-3" fill="none" stroke="#548485" stroke-width=".8"/>
+ <path d="M16 10h10m-10 2h6" stroke="#537b78" stroke-width=".55"/>
+ <g fill="none" stroke-linecap="round"><path d="M6 13l6-1" stroke="#102e34" stroke-width="3.5"/><path d="M6 12l6-1" stroke="#edcd8b" stroke-width="2"/><path d="M6 26l6-1" stroke="#102e34" stroke-width="3.5"/><path d="M6 25l6-1" stroke="#edcd8b" stroke-width="2"/><path d="M6 39l6-1" stroke="#102e34" stroke-width="3.5"/><path d="M6 38l6-1" stroke="#edcd8b" stroke-width="2"/><path d="M6 52l6-1" stroke="#102e34" stroke-width="3.5"/><path d="M6 51l6-1" stroke="#edcd8b" stroke-width="2"/></g><rect x="23" y="43" width="6" height="7" rx=".6" fill="#bd5744"/><path d="M25 45v3m2-3v3" stroke="#f8cf9e" stroke-width=".8"/></g></svg>

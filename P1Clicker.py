@@ -651,8 +651,10 @@ class App:
         root.iconbitmap(str(icon))
         self.window_icons = apply_window_icons(root, icon)
         brand_size = round(40 * root.winfo_fpixels("1i") / 96)
-        self.brand = ImageTk.PhotoImage(Image.open(icon.with_suffix(".png")).resize(
-            (brand_size, brand_size), Image.Resampling.LANCZOS))
+        with Image.open(icon) as artwork:
+            size = min(artwork.ico.sizes(), key=lambda pair: abs(pair[0] - brand_size))
+            self.brand = ImageTk.PhotoImage(artwork.ico.getimage(size).resize(
+                (brand_size, brand_size), Image.Resampling.LANCZOS))
         root.option_add("*Font", "{Microsoft JhengHei UI} 10")
         self.style = ttk.Style(root)
         self.style.theme_use("clam")
