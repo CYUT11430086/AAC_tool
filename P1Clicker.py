@@ -17,6 +17,8 @@ from math import ceil
 import tkinter as tk
 from tkinter import ttk
 
+from cultivation_update import auto_update_enabled, save_auto_update
+
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageGrab, ImageTk, ImageFont
@@ -34,12 +36,15 @@ u.GetAncestor.argtypes = [wt.HWND, wt.UINT]
 u.GetAncestor.restype = wt.HWND
 u.GetForegroundWindow.restype = wt.HWND
 
+PICTURES = Path(__file__).with_name("PNGpicture")
+
+
 def orb_mask(image):
     hsv = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2HSV)
     return cv2.inRange(hsv, (79, 48, 110), (101, 255, 255))
 
 
-reference = Image.open(Path(__file__).with_name("P1.png")).convert("RGB")
+reference = Image.open((PICTURES / "P1.png")).convert("RGB")
 _, labels, stats, _ = cv2.connectedComponentsWithStats(orb_mask(reference))
 orb_id = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
 rx, ry, rw, rh, _ = stats[orb_id]
@@ -50,7 +55,7 @@ silhouette = labels[ry:ry + rh, rx:rx + rw] == orb_id
 caption = np.asarray(reference.convert("L").crop((63, 190, 168, 220)))
 
 
-game_caption = np.asarray(Image.open(Path(__file__).with_name("P2-caption.png")).convert("L"))
+game_caption = np.asarray(Image.open((PICTURES / "P2-caption.png")).convert("L"))
 
 
 def has_orb_caption(frame, x, y, w, h):
@@ -209,7 +214,7 @@ def device_frame(target):
 
 
 def shop_template(name, crop):
-    image = Image.open(Path(__file__).with_name(name)).convert("L").resize((140, 48))
+    image = Image.open(PICTURES / name).convert("L").resize((140, 48))
     return np.asarray(image)[crop]
 
 
@@ -221,7 +226,7 @@ SHOP_IMAGES = {
 }
 
 
-STORE_FACE = Image.open(Path(__file__).with_name("store.png")).convert("RGB").crop((5, 4, 135, 64))
+STORE_FACE = Image.open((PICTURES / "store.png")).convert("RGB").crop((5, 4, 135, 64))
 
 
 def locate_store(frame):
@@ -296,9 +301,9 @@ def shop_button(frame, kind):
     return point
 
 
-DJ_BANNER = Image.open(Path(__file__).with_name("Dj_up.png")).convert("RGB")
+DJ_BANNER = Image.open((PICTURES / "Dj_up.png")).convert("RGB")
 DJ_ICON = np.asarray(DJ_BANNER.crop((5, 6, 93, 92)).convert("L"))
-DJ_ROW = np.asarray(Image.open(Path(__file__).with_name("Dj_P.png")).convert("RGB"))
+DJ_ROW = np.asarray(Image.open((PICTURES / "Dj_P.png")).convert("RGB"))
 
 
 def light_letters(rgb):
@@ -394,9 +399,9 @@ def inspect_tribulation(target, cancelled):
             return rate, (round(x+DJ_BANNER.width*scale/2), round(y+DJ_BANNER.height*scale/2))
 
 
-DJ_DIALOG_TITLE = np.asarray(Image.open(Path(__file__).with_name("Dj_2up.png"))
+DJ_DIALOG_TITLE = np.asarray(Image.open((PICTURES / "Dj_2up.png"))
                              .convert("L").crop((222, 7, 352, 55)))
-DJ_CONFIRM_FACE = np.asarray(Image.open(Path(__file__).with_name("Dj_2_c.png"))
+DJ_CONFIRM_FACE = np.asarray(Image.open((PICTURES / "Dj_2_c.png"))
                              .convert("L").crop((7, 6, 264, 77)))
 
 
@@ -434,6 +439,69 @@ def inspect_shop(target, cancelled, stage):
         frame = device_frame(target)
         upgrade = shop_button(frame, "upgrade") if stage == "inside" else None
         return upgrade, None if upgrade else shop_button(frame, "store")
+
+
+@lru_cache(maxsize=3)
+def sword_template(name):
+    with Image.open(PICTURES / (name + ".png")) as image:
+        return np.asarray(image.convert("RGB"))
+
+
+def sword_button(frame, name, region=None):
+    # The references are cropped screenshots. Search at several button sizes.
+    box = region or (0, 0, frame.width, frame.height)
+    area = frame.crop(box)
+    ratio = min(1, 800 / frame.width)
+    rgb = np.asarray(area.resize((max(1, round(area.width * ratio)),
+                                  max(1, round(area.height * ratio)))))
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    source = sword_template(name)
+    best, found = .84, None
+    widths = [source.shape[1] * ratio, source.shape[1] * frame.width / 1808 * ratio] + list(
+        np.geomspace(10, min(600, rgb.shape[1]), 120))
+    for width in widths:
+        w = round(width)
+        h = max(1, round(w * source.shape[0] / source.shape[1]))
+        if w > rgb.shape[1] or h > rgb.shape[0]:
+            continue
+        template = cv2.resize(source, (w, h), interpolation=cv2.INTER_AREA)
+        scores = cv2.matchTemplate(gray, cv2.cvtColor(template, cv2.COLOR_RGB2GRAY),
+                                   cv2.TM_CCOEFF_NORMED)
+        _, score, _, (x, y) = cv2.minMaxLoc(scores)
+        if score > best and np.abs(rgb[y:y+h, x:x+w].astype(np.int16) - template).mean() < 32:
+            best = score
+            found = (box[0] + round((x+w/2)/ratio), box[1] + round((y+h/2)/ratio))
+    return found
+
+
+def check_sword(target, cancelled, stopped):
+    frame = device_frame(target)
+    entry = sword_button(frame, "swort_in_bt")
+    if not entry or cancelled.is_set() or stopped.is_set():
+        return True
+    device_tap(target, entry, cancelled)
+    for _ in range(8):
+        if cancelled.wait(.4):
+            return True
+        frame = device_frame(target)
+        close = sword_button(frame, "sword_exit")
+        if close:
+            break
+    else:
+        return False
+    upgrade = sword_button(frame, "sword_up_bt", (0, close[1], frame.width//2, frame.height))
+    if upgrade and not stopped.is_set():
+        device_tap(target, upgrade, cancelled)
+        if cancelled.wait(.65):
+            return True
+        close = sword_button(device_frame(target), "sword_exit")
+    if not close:
+        return False
+    device_tap(target, close, cancelled)
+    for _ in range(5):
+        if cancelled.wait(.4) or not sword_button(device_frame(target), "sword_exit"):
+            return True
+    return False
 
 
 def device_observation(target, cancelled):
@@ -501,10 +569,84 @@ def apply_window_icons(root, path):
     return handles
 
 
+class TimeWheel(tk.Canvas):
+    row_height = 22
+
+    def __init__(self, parent, value, unit, command):
+        super().__init__(parent, width=72, height=66, takefocus=True,
+                         highlightthickness=0, borderwidth=0)
+        self.command = command
+        self.unit = unit
+        self.position = self.goal = value
+        self.animation = None
+        self.bind("<ButtonPress-1>", self.press)
+        self.bind("<B1-Motion>", self.drag)
+        self.bind("<ButtonRelease-1>", self.release)
+        self.bind("<MouseWheel>", lambda e: self.select(self.goal - (1 if e.delta > 0 else -1)))
+        for key, step in (("Up", -1), ("Down", 1), ("Prior", -10), ("Next", 10)):
+            self.bind("<" + key + ">", lambda e, step=step: self.select(self.goal + step))
+
+    def theme(self, bg, surface, ink, muted):
+        self.colors = surface, ink, muted
+        self.configure(background=bg)
+        self.paint()
+
+    def paint(self):
+        self.delete("all")
+        surface, ink, muted = self.colors
+        self.create_rectangle(2, 22, 71, 46, fill=surface, outline="")
+        center = round(self.position)
+        for n in range(max(0, center-2), min(59, center+2)+1):
+            selected = n == center
+            self.create_text(37, 34+(n-self.position)*self.row_height,
+                             text=f"{n} {self.unit}" if selected else str(n),
+                             font=("Microsoft JhengHei UI", 11 if selected else 9,
+                                   "bold" if selected else "normal"),
+                             fill=ink if selected else muted)
+
+    def stop_animation(self):
+        if self.animation is not None:
+            self.after_cancel(self.animation)
+            self.animation = None
+
+    def press(self, event):
+        self.focus_set()
+        self.stop_animation()
+        self.start_y = event.y
+        self.origin = self.position
+
+    def drag(self, event):
+        self.position = max(0, min(59, self.origin + (self.start_y-event.y)/self.row_height))
+        self.paint()
+
+    def release(self, event):
+        self.drag(event)
+        offset = round((event.y-34)/self.row_height) if abs(event.y-self.start_y)<4 else 0
+        self.select(round(self.position)+offset)
+
+    def select(self, value):
+        self.stop_animation()
+        self.goal = max(0, min(59, value))
+        self.snap()
+        self.command()
+
+    def snap(self):
+        distance = self.goal-self.position
+        self.animation = None
+        if abs(distance) < .025:
+            self.position = self.goal
+        else:
+            self.position += distance * .35
+            self.animation = self.after(16, self.snap)
+        self.paint()
+
+
 class App:
+    sword_interval_seconds = 30
+
     def __init__(self, root):
         self.root = root
-        root.title("P1 圖像自動點擊")
+        root.title("修仙祕笈")
         icon = Path(__file__).with_name("P1Clicker.ico")
         root.iconbitmap(str(icon))
         self.window_icons = apply_window_icons(root, icon)
@@ -519,11 +661,14 @@ class App:
         panel.pack(fill="both", expand=True)
         panel.columnconfigure(0, weight=1, uniform="controls")
         panel.columnconfigure(1, weight=1, uniform="controls")
-        ttk.Label(panel, text="  P1 圖像自動點擊", image=self.brand, compound="left",
+        ttk.Label(panel, text="  修仙祕笈", image=self.brand, compound="left",
                   font=("Microsoft JhengHei UI", 16, "bold")).grid(row=0, columnspan=2, sticky="w", pady=(0, 16))
         ttk.Checkbutton(panel, text="深色模式", variable=self.dark, command=self.apply_theme).grid(
             row=0, column=1, sticky="e", pady=(0, 16))
         ttk.Label(panel, text="目標視窗").grid(row=1, column=0, sticky="w")
+        self.auto_update = tk.BooleanVar(value=auto_update_enabled())
+        ttk.Checkbutton(panel, text="自動更新軟體", variable=self.auto_update,
+                        command=self.change_auto_update).grid(row=1, column=1, sticky="e")
         self.window_glyph = tk.PhotoImage(width=20, height=18)
         self.combo = ttk.Menubutton(panel, image=self.window_glyph, direction="below", compound="left",
                                     style="Picker.TMenubutton", takefocus=True)
@@ -560,7 +705,7 @@ class App:
             self.switch_images.append(ImageTk.PhotoImage(icon))
         self.shop_switch = ttk.Checkbutton(panel, text="自動升級商店", compound="left",
                                           variable=self.shop_enabled, command=self.toggle_shop)
-        self.shop_switch.configure(image=self.switch_images[0], style="Toolbutton")
+        self.shop_switch.configure(image=self.switch_images[0], style="Switch.Toolbutton")
         self.shop_switch.grid(row=6, column=0, sticky="w")
         self.shop_switch.grid_remove()
         self.shop_interval = ttk.Combobox(panel, state="readonly", width=16,
@@ -574,7 +719,7 @@ class App:
         self.dj_due = float("inf")
         self.dj_switch = ttk.Checkbutton(panel, text="自動渡劫", compound="left",
                                          variable=self.dj_enabled, command=self.toggle_dj,
-                                         image=self.switch_images[0], style="Toolbutton")
+                                         image=self.switch_images[0], style="Switch.Toolbutton")
         self.adb_separator = ttk.Separator(panel, orient="horizontal")
         self.adb_separator.grid(row=7, columnspan=2, sticky="ew", pady=6)
         self.adb_separator.grid_remove()
@@ -594,11 +739,33 @@ class App:
         self.dj_interval.pack(anchor="e", pady=(3, 0))
         self.dj_interval.bind("<<ComboboxSelected>>", lambda _: self.toggle_dj())
 
+        self.sword_separator = ttk.Separator(panel, orient="horizontal")
+        self.sword_separator.grid(row=9, columnspan=2, sticky="ew", pady=6)
+        self.sword_separator.grid_remove()
+        self.upgrade_progress = ttk.Progressbar(panel, mode="indeterminate")
+        self.upgrade_progress.grid(row=11, columnspan=2, sticky="ew", pady=(6, 0))
+        self.upgrade_progress.grid_remove()
+        self.sword_enabled = tk.BooleanVar(value=True)
+        self.sword_stop = Event()
+        self.sword_switch = ttk.Checkbutton(panel, text="自動升級寶劍", compound="left",
+            variable=self.sword_enabled, command=self.toggle_sword,
+            image=self.switch_images[-1], style="Switch.Toolbutton")
+        self.switch_positions[self.sword_switch] = len(self.switch_images)-1
+        self.sword_switch.grid(row=10, column=0, sticky="w", pady=(6, 0))
+        self.sword_wheels = ttk.Frame(panel)
+        self.sword_wheels.grid(row=10, column=1, sticky="e", pady=(6, 0))
+        minutes, seconds = divmod(self.sword_interval_seconds, 60)
+        self.minute_wheel = TimeWheel(self.sword_wheels, minutes, "分", self.set_sword_interval)
+        self.second_wheel = TimeWheel(self.sword_wheels, seconds, "秒", self.set_sword_interval)
+        self.minute_wheel.pack(side="left")
+        self.second_wheel.pack(side="left")
+        self.sword_switch.grid_remove()
+        self.sword_wheels.grid_remove()
+
         self.timer = None
         self.release_timer = None
         self.pending = None
         self.anchor = None
-        self.choices = []
         self.preview_timer = None
         self.preview_job = None
         self.preview_key = None
@@ -664,9 +831,19 @@ class App:
         muted = "#9caeb0" if dark else "#617574"
         inactive = "#2c3c40" if dark else "#dce6e4"
         secondary_hover = "#334a50" if dark else "#e4efec"
+        for wheel in (self.minute_wheel, self.second_wheel):
+            wheel.theme(bg, surface, ink, muted)
         style = self.style
         self.root.configure(background=bg)
         style.configure(".", background=bg, foreground=ink, font=("Microsoft JhengHei UI", 10))
+        style.layout("Switch.Toolbutton", [("Toolbutton.padding", {"sticky": "nswe",
+                     "children": [("Toolbutton.label", {"sticky": "nswe"})]})])
+        style.configure("Horizontal.TProgressbar", background=accent, troughcolor=surface)
+        style.configure("Switch.Toolbutton", background=bg, foreground=ink,
+                        relief="flat", borderwidth=0, focuscolor=accent)
+        style.map("Switch.Toolbutton", background=[("", bg)], foreground=[("", ink)],
+                  relief=[("", "flat")], bordercolor=[("", bg)],
+                  lightcolor=[("", bg)], darkcolor=[("", bg)])
         style.configure("TCheckbutton", background=bg, foreground=ink, focuscolor=accent)
         style.map("TCheckbutton", background=[("active", bg)], indicatorbackground=[
             ("selected", accent), ("!selected", surface)])
@@ -680,6 +857,21 @@ class App:
                             relief="flat", borderwidth=1, bordercolor=edge, focuscolor=text)
             style.map(name, background=[("disabled", inactive), ("pressed", down), ("active", over)],
                       foreground=[("disabled", muted)], bordercolor=[("focus", accent)])
+        style.configure("TCombobox", foreground=ink, fieldbackground=surface,
+                        background=surface, arrowcolor=ink, bordercolor=edge)
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", surface)],
+                  foreground=[("readonly", ink)],
+                  selectbackground=[("readonly", surface)],
+                  selectforeground=[("readonly", ink)],
+                  background=[("active", secondary_hover), ("readonly", surface)],
+                  arrowcolor=[("readonly", ink)], bordercolor=[("focus", accent)])
+        # The popup list is a classic Tk listbox, independent of the ttk field.
+        for combo in (self.shop_interval, self.dj_threshold, self.dj_interval):
+            popup = combo.tk.call("ttk::combobox::PopdownWindow", combo)
+            combo.tk.call(f"{popup}.f.l", "configure", "-background", surface,
+                          "-foreground", ink, "-selectbackground", accent,
+                          "-selectforeground", on_accent)
         style.configure("Picker.TMenubutton", background=surface, foreground=ink,
                         anchor="w", width=30, padding=(10, 7), arrowsize=16, arrowcolor=ink, bordercolor=edge)
         style.map("Picker.TMenubutton", background=[("disabled", inactive), ("active", secondary_hover)],
@@ -708,26 +900,28 @@ class App:
             self.toggle_shop()
         if isinstance(self.selection, tuple):
             self.adb_separator.grid()
+            self.sword_separator.grid()
+            self.sword_switch.grid()
+            self.sword_wheels.grid()
             self.dj_options.grid()
             self.dj_switch.grid()
             self.shop_switch.grid()
             self.shop_interval.grid()
         else:
             self.adb_separator.grid_remove()
+            self.sword_separator.grid_remove()
+            self.sword_switch.grid_remove()
+            self.sword_wheels.grid_remove()
             self.dj_options.grid_remove()
             self.dj_switch.grid_remove()
             self.shop_switch.grid_remove()
             self.shop_interval.grid_remove()
-        title = next((name for name, hwnd in self.choices + self.devices if hwnd == self.selection), "")
-        self.combo.configure(text=("  " + title) if title else "")
+        title = next((name for name, hwnd in self.devices if hwnd == self.selection), "")
+        self.combo.configure(text="  " + (title or "搜尋雷電 ADB 裝置"))
 
     def populate_menu(self):
         self.refresh()
         self.menu.delete(0, "end")
-        for name, hwnd in self.choices:
-            self.menu.add_command(label=name, command=lambda h=hwnd: self.choose_window(h))
-
-        self.menu.add_separator()
         self.menu.add_command(label="搜尋雷電 ADB 裝置", command=self.discover_devices)
         for name, target in self.devices:
             self.menu.add_command(label=name, command=lambda t=target: self.choose_window(t))
@@ -771,9 +965,8 @@ class App:
             self.status.set("請展開選單選擇 ADB 裝置。" if self.devices else "找不到裝置，請啟動雷電並開啟 ADB 本機連線。")
 
     def refresh(self):
-        self.choices = windows()
-        if not any(hwnd == self.selection for _, hwnd in self.choices + self.devices):
-            self.selection = self.choices[0][1] if self.choices else None
+        if not any(hwnd == self.selection for _, hwnd in self.devices):
+            self.selection = None
         self.update_selection_label()
         self.update_preview()
 
@@ -861,7 +1054,7 @@ class App:
         self.target = self.selected()
         if not self.target or (not isinstance(self.target, tuple) and not taskbar_window(self.target)):
             self.refresh()
-            self.status.set("請重新選擇目標視窗。")
+            self.status.set("請先搜尋並選取 ADB 裝置。")
             return
         self.release_preview()
         self.preview.grid_remove()
@@ -876,6 +1069,7 @@ class App:
             u.SetForegroundWindow(self.target)
         if isinstance(self.target, tuple):
             self.cancelled = Event()
+            self.reset_sword_timer()
             self.device_missing = 0
             self.device_size = None
             self.device_scan()
@@ -931,6 +1125,42 @@ class App:
         else:
             self.timer = self.root.after(250, self.check_dj_confirm)
 
+    def reset_sword_timer(self):
+        self.sword_due = (monotonic() + self.sword_interval_seconds
+                          if self.sword_enabled.get() else float("inf"))
+
+    def toggle_sword(self):
+        enabled = self.sword_enabled.get()
+        if enabled:
+            self.sword_stop = Event()
+        else:
+            self.sword_stop.set()
+        self.animate_switch(self.sword_switch, enabled)
+        self.reset_sword_timer()
+
+    def set_sword_interval(self):
+        seconds = 60 * self.minute_wheel.goal + self.second_wheel.goal
+        if seconds == 0:
+            self.second_wheel.select(1)
+            return
+        self.sword_interval_seconds = seconds
+        self.reset_sword_timer()
+
+    def change_auto_update(self):
+        try:
+            save_auto_update(self.auto_update.get())
+        except OSError:
+            self.auto_update.set(auto_update_enabled())
+            self.status.set("無法儲存自動更新設定。")
+
+    def show_upgrade_progress(self):
+        self.upgrade_progress.grid()
+        self.upgrade_progress.start(18)
+
+    def hide_upgrade_progress(self):
+        self.upgrade_progress.stop()
+        self.upgrade_progress.grid_remove()
+
     def toggle_shop(self):
         enabled = self.shop_enabled.get()
         self.animate_switch(self.shop_switch, enabled)
@@ -940,6 +1170,7 @@ class App:
         upgrade, store = buttons
         if self.shop_stage == "open" and not self.shop_enabled.get():
             self.shop_stage = None
+            self.hide_upgrade_progress()
             self.schedule_device_scan()
             return
         if self.shop_stage == "inside" and not self.shop_enabled.get():
@@ -975,6 +1206,7 @@ class App:
     def shop_finished(self, stage):
         self.shop_stage = stage
         if stage is None:
+            self.hide_upgrade_progress()
             self.toggle_shop()
         self.timer = self.root.after(850, self.device_scan)
 
@@ -985,9 +1217,17 @@ class App:
             self.shop_empty = 0
             self.shop_timeout = self.sample_started + 12
         if self.shop_stage:
+            self.show_upgrade_progress()
             self.status.set("正在檢查商店升級…")
             job = self.preview_pool.submit(inspect_shop, self.target, self.cancelled, self.shop_stage)
             self.await_device(job, self.shop_result)
+            return
+        if self.sample_started >= self.sword_due:
+            self.sword_due = float("inf")
+            self.show_upgrade_progress()
+            self.status.set("正在檢查寶劍升級…")
+            job = self.preview_pool.submit(check_sword, self.target, self.cancelled, self.sword_stop)
+            self.await_device(job, self.sword_finished)
             return
         if self.sample_started >= self.dj_due:
             self.dj_due = self.sample_started + 60 * (1 + self.dj_interval.current())
@@ -998,6 +1238,13 @@ class App:
         job = self.preview_pool.submit(device_observation, self.target, self.cancelled)
         self.await_device(job, self.device_result)
 
+    def sword_finished(self, closed):
+        self.hide_upgrade_progress()
+        self.reset_sword_timer()
+        if not closed:
+            self.status.set("未確認寶劍介面，繼續偵測靈氣。")
+        self.schedule_device_scan()
+
     def await_device(self, job, callback, tap=False):
         if self.cancelled.is_set():
             return
@@ -1007,6 +1254,7 @@ class App:
         try:
             result = job.result()
         except (OSError, ValueError, cv2.error) as error:
+            self.hide_upgrade_progress()
             if tap and (self.shop_stage or callback not in (self.device_clicked, self.dj_opened)):
                 self.pause()
                 self.shop_stage = None
@@ -1020,6 +1268,8 @@ class App:
         callback(result)
 
     def device_reconnected(self, _):
+        if self.sword_due == float("inf") and self.sword_enabled.get():
+            self.reset_sword_timer()
         self.shop_timeout = monotonic() + 12
         self.device_scan()
 
@@ -1058,6 +1308,7 @@ class App:
         self.anchor = None
 
     def pause(self):
+        self.hide_upgrade_progress()
         self.release_mouse()
         self.cancelled.set()
         self.clear_target()
@@ -1187,7 +1438,17 @@ if __name__ == "__main__":
         root.destroy()
     else:
         root = tk.Tk()
-        App(root)
+        if getattr(sys, "frozen", False):
+            from cultivation_update import initialize_storage
+            initialize_storage()
+        if getattr(sys, 'frozen', False) and '--updated-launch' not in sys.argv:
+            from cultivation_update import start_release
+            start_release(root, App)
+        else:
+            App(root)
+            if getattr(sys, "frozen", False) and len(sys.argv) == 3 and sys.argv[1] == "--updated-launch":
+                from cultivation_update import signal_ready
+                root.after_idle(signal_ready, sys.argv[2])
         root.mainloop()
 
 
