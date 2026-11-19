@@ -4,6 +4,7 @@ import os
 import subprocess
 import shutil
 import struct
+from collections import deque
 from threading import Event
 from io import BytesIO
 from tkinter import filedialog
@@ -17,7 +18,7 @@ from math import ceil
 import tkinter as tk
 from tkinter import ttk
 
-from cultivation_update import auto_update_enabled, save_auto_update
+from cultivation_update import start_release
 
 import cv2
 import numpy as np
@@ -37,6 +38,10 @@ u.GetAncestor.restype = wt.HWND
 u.GetForegroundWindow.restype = wt.HWND
 
 PICTURES = Path(__file__).with_name("PNGpicture")
+
+
+cv2.setNumThreads(1)
+cv2.ocl.setUseOpenCL(False)
 
 
 def orb_mask(image):
@@ -207,7 +212,8 @@ def device_frame(target):
         width, height, fmt = struct.unpack_from("<III", raw)
         offset = len(raw) - width * height * 4
         if fmt in (1, 2) and offset in (12, 16) and width and height:
-            return Image.frombytes("RGB", (width, height), raw[offset:], "raw", "RGBX")
+            return Image.frombytes("RGB", (width, height), memoryview(raw)[offset:], "raw", "RGBX")
+    del raw
     data = adb_command(*args, "-p")
     with Image.open(BytesIO(data)) as frame:
         return frame.convert("RGB")
@@ -447,10 +453,10 @@ def sword_template(name):
         return np.asarray(image.convert("RGB"))
 
 
-def sword_button(frame, name, region=None):
+def sword_button(frame, name, region=None, with_scale=False):
     # The references are cropped screenshots. Search at several button sizes.
     box = region or (0, 0, frame.width, frame.height)
-    area = frame.crop(box)
+    area = frame.crop(box) if region else frame
     ratio = min(1, 800 / frame.width)
     rgb = np.asarray(area.resize((max(1, round(area.width * ratio)),
                                   max(1, round(area.height * ratio)))))
@@ -459,8 +465,7 @@ def sword_button(frame, name, region=None):
     best, found = .84, None
     widths = [source.shape[1] * ratio, source.shape[1] * frame.width / 1808 * ratio] + list(
         np.geomspace(10, min(600, rgb.shape[1]), 120))
-    for width in widths:
-        w = round(width)
+    for w in dict.fromkeys(map(round, widths)):
         h = max(1, round(w * source.shape[0] / source.shape[1]))
         if w > rgb.shape[1] or h > rgb.shape[0]:
             continue
@@ -471,10 +476,40 @@ def sword_button(frame, name, region=None):
         if score > best and np.abs(rgb[y:y+h, x:x+w].astype(np.int16) - template).mean() < 32:
             best = score
             found = (box[0] + round((x+w/2)/ratio), box[1] + round((y+h/2)/ratio))
+            if with_scale:
+                found = (found, w / (source.shape[1] * ratio))
     return found
 
 
-def check_sword(target, cancelled, stopped):
+def sword_stage_image(frame, anchor):
+    # Locate the five pill-shaped segments below the close button, including
+    # empty segments. The title and coloured fill change as the sword advances.
+    (x, y), scale = anchor
+    left, top = max(0, round(x-750*scale)), max(0, round(y+20*scale))
+    right, bottom = min(frame.width, round(x+70*scale)), min(frame.height, round(y+85*scale))
+    if left >= right or top >= bottom:
+        return None
+    rgb = np.asarray(frame.crop((left, top, right, bottom)))
+    filled = cv2.inRange(rgb, (89, 211, 186), (138, 255, 235))
+    empty = cv2.inRange(rgb, (53, 53, 72), (68, 68, 89))
+    contours, _ = cv2.findContours(filled | empty, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    bars = sorted(cv2.boundingRect(c) for c in contours)
+    bars = [(x,y,w,h) for x,y,w,h in bars if 4 <= w/h <= 13 and w >= 55*scale]
+    for i in range(len(bars)-4):
+        group = bars[i:i+5]
+        bx, by, bw, bh = group[0]
+        if all(abs(cy-by) <= max(2, bh/3) and abs(cw-bw) < bw*.2
+               and 0 < cx-px-pw < bw*.4
+               for (px, _, pw, _), (cx,cy,cw,_) in zip(group, group[1:])):
+            last = group[-1]
+            pad = max(1, round(bh*.4))
+            return frame.crop((left+bx-pad, top+by-pad, left+last[0]+last[2]+pad,
+                               top+by+bh+pad)).resize((279, 15), Image.Resampling.LANCZOS)
+    return None
+
+
+def check_sword(target, cancelled, stopped, stages):
+
     frame = device_frame(target)
     entry = sword_button(frame, "swort_in_bt")
     if not entry or cancelled.is_set() or stopped.is_set():
@@ -484,8 +519,10 @@ def check_sword(target, cancelled, stopped):
         if cancelled.wait(.4):
             return True
         frame = device_frame(target)
-        close = sword_button(frame, "sword_exit")
-        if close:
+        anchor = sword_button(frame, "sword_exit", with_scale=True)
+        if anchor:
+            close = anchor[0]
+            stages.append(sword_stage_image(frame, anchor))
             break
     else:
         return False
@@ -494,7 +531,11 @@ def check_sword(target, cancelled, stopped):
         device_tap(target, upgrade, cancelled)
         if cancelled.wait(.65):
             return True
-        close = sword_button(device_frame(target), "sword_exit")
+        frame = device_frame(target)
+        anchor = sword_button(frame, "sword_exit", with_scale=True)
+        close = anchor[0] if anchor else None
+        if anchor:
+            stages.append(sword_stage_image(frame, anchor))
     if not close:
         return False
     device_tap(target, close, cancelled)
@@ -644,7 +685,7 @@ class TimeWheel(tk.Canvas):
 class App:
     sword_interval_seconds = 30
 
-    def __init__(self, root):
+    def __init__(self, root, available=None):
         self.root = root
         root.title("修仙祕笈")
         icon = Path(__file__).with_name("P1Clicker.ico")
@@ -663,14 +704,20 @@ class App:
         panel.pack(fill="both", expand=True)
         panel.columnconfigure(0, weight=1, uniform="controls")
         panel.columnconfigure(1, weight=1, uniform="controls")
-        ttk.Label(panel, text="  修仙祕笈", image=self.brand, compound="left",
-                  font=("Microsoft JhengHei UI", 16, "bold")).grid(row=0, columnspan=2, sticky="w", pady=(0, 16))
+        title = ttk.Frame(panel)
+        title.grid(row=0, columnspan=2, sticky="w", pady=(0, 16))
+        ttk.Label(title, text="  修仙祕笈", image=self.brand, compound="left",
+                  font=("Microsoft JhengHei UI", 16, "bold")).pack(side="left")
+        if available:
+            self.download_icon = tk.PhotoImage(width=18, height=18)
+            for row, span in enumerate((2, 2, 2, 2, 2, 2, 12, 10, 8, 6, 4, 2)):
+                self.download_icon.put("#148f80", to=(9-span//2, row+1, 9+span//2, row+2))
+            self.download_icon.put("#148f80", to=(2, 14, 16, 16))
+            ttk.Button(title, image=self.download_icon, text="下載新版",
+                       command=lambda: self.install_release(available)).pack(side="left", padx=5)
         ttk.Checkbutton(panel, text="深色模式", variable=self.dark, command=self.apply_theme).grid(
             row=0, column=1, sticky="e", pady=(0, 16))
         ttk.Label(panel, text="目標視窗").grid(row=1, column=0, sticky="w")
-        self.auto_update = tk.BooleanVar(value=auto_update_enabled())
-        ttk.Checkbutton(panel, text="自動更新軟體", variable=self.auto_update,
-                        command=self.change_auto_update).grid(row=1, column=1, sticky="e")
         self.window_glyph = tk.PhotoImage(width=20, height=18)
         self.combo = ttk.Menubutton(panel, image=self.window_glyph, direction="below", compound="left",
                                     style="Picker.TMenubutton", takefocus=True)
@@ -744,8 +791,13 @@ class App:
         self.sword_separator = ttk.Separator(panel, orient="horizontal")
         self.sword_separator.grid(row=9, columnspan=2, sticky="ew", pady=6)
         self.sword_separator.grid_remove()
+        self.stage_updates = deque(maxlen=1)
+        self.stage_photo = None
+        self.stage_label = ttk.Label(panel, text="寶劍階段：等待檢查")
+        self.stage_label.grid(row=11, columnspan=2, sticky="w", pady=(4, 0))
+        self.stage_label.grid_remove()
         self.upgrade_progress = ttk.Progressbar(panel, mode="indeterminate")
-        self.upgrade_progress.grid(row=11, columnspan=2, sticky="ew", pady=(6, 0))
+        self.upgrade_progress.grid(row=12, columnspan=2, sticky="ew", pady=(6, 0))
         self.upgrade_progress.grid_remove()
         self.sword_enabled = tk.BooleanVar(value=True)
         self.sword_stop = Event()
@@ -896,6 +948,9 @@ class App:
         if self.shop_owner != self.selection:
             self.dj_enabled.set(False)
             self.toggle_dj()
+            self.stage_label.configure(image="", text="寶劍階段：等待檢查")
+            self.stage_photo = None
+            self.stage_updates = deque(maxlen=1)
             self.shop_owner = self.selection
             self.shop_stage = None
             self.shop_enabled.set(False)
@@ -903,6 +958,7 @@ class App:
         if isinstance(self.selection, tuple):
             self.adb_separator.grid()
             self.sword_separator.grid()
+            self.stage_label.grid()
             self.sword_switch.grid()
             self.sword_wheels.grid()
             self.dj_options.grid()
@@ -912,6 +968,7 @@ class App:
         else:
             self.adb_separator.grid_remove()
             self.sword_separator.grid_remove()
+            self.stage_label.grid_remove()
             self.sword_switch.grid_remove()
             self.sword_wheels.grid_remove()
             self.dj_options.grid_remove()
@@ -1035,7 +1092,10 @@ class App:
             frame = self.preview_job.result()
             self.preview_job = None
             if self.preview_key == key and frame is not None:
-                self.preview_image = ImageTk.PhotoImage(frame)
+                if self.preview_image is not None and (self.preview_image.width(), self.preview_image.height()) == frame.size:
+                    self.preview_image.paste(frame)
+                else:
+                    self.preview_image = ImageTk.PhotoImage(frame)
                 self.preview_note.configure(image=self.preview_image, text="")
             else:
                 self.preview_note.configure(image="", text="無可用預覽")
@@ -1071,6 +1131,7 @@ class App:
             u.SetForegroundWindow(self.target)
         if isinstance(self.target, tuple):
             self.cancelled = Event()
+            self.stage_updates = deque(maxlen=1)
             self.reset_sword_timer()
             self.device_missing = 0
             self.device_size = None
@@ -1148,12 +1209,19 @@ class App:
         self.sword_interval_seconds = seconds
         self.reset_sword_timer()
 
-    def change_auto_update(self):
-        try:
-            save_auto_update(self.auto_update.get())
-        except OSError:
-            self.auto_update.set(auto_update_enabled())
-            self.status.set("無法儲存自動更新設定。")
+    def install_release(self, asset):
+        if self.start_button.instate(["disabled"]):
+            self.pause()
+        dialog = tk.Toplevel(self.root)
+        dialog.transient(self.root)
+        self.root.attributes("-disabled", True)
+
+        def resume(window, unused):
+            window.destroy()
+            self.root.attributes("-disabled", False)
+            self.root.focus_force()
+
+        start_release(dialog, resume, asset=asset, installed=self.close)
 
     def show_upgrade_progress(self):
         self.upgrade_progress.grid()
@@ -1228,7 +1296,7 @@ class App:
             self.sword_due = float("inf")
             self.show_upgrade_progress()
             self.status.set("正在檢查寶劍升級…")
-            job = self.preview_pool.submit(check_sword, self.target, self.cancelled, self.sword_stop)
+            job = self.preview_pool.submit(check_sword, self.target, self.cancelled, self.sword_stop, self.stage_updates)
             self.await_device(job, self.sword_finished)
             return
         if self.sample_started >= self.dj_due:
@@ -1250,8 +1318,16 @@ class App:
     def await_device(self, job, callback, tap=False):
         if self.cancelled.is_set():
             return
+        if self.stage_updates:
+            strip = self.stage_updates.popleft()
+            if strip is not None:
+                if self.stage_photo is None:
+                    self.stage_photo = ImageTk.PhotoImage(strip)
+                    self.stage_label.configure(image=self.stage_photo, text="最近寶劍階段  ", compound="right")
+                else:
+                    self.stage_photo.paste(strip)
         if not job.done():
-            self.timer = self.root.after(5, self.await_device, job, callback, tap)
+            self.timer = self.root.after(25, self.await_device, job, callback, tap)
             return
         try:
             result = job.result()
@@ -1442,7 +1518,7 @@ if __name__ == "__main__":
         root = tk.Tk()
         if getattr(sys, "frozen", False):
             from cultivation_update import initialize_storage
-            initialize_storage()
+            initialize_storage(updated="--updated-launch" in sys.argv)
         if getattr(sys, 'frozen', False) and '--updated-launch' not in sys.argv:
             from cultivation_update import start_release
             start_release(root, App)

@@ -17,7 +17,7 @@ from threading import Event, Thread
 from queue import Empty, Queue
 from urllib.request import Request, urlopen
 
-VERSION = "1.3.2"
+VERSION = "1.5.0"
 REPO = "CYUT11430086/AAC_tool"
 API = f"https://api.github.com/repos/{REPO}/releases/latest"
 SEMVER = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
@@ -28,17 +28,9 @@ SETTINGS_KEY = r"Software\CultivationSettings"
 PART_NAME = re.compile(r"\.cultivation-update-[0-9a-f]{32}\.part")
 
 
-def read_setting(path):
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path) as key:
-        value, kind = winreg.QueryValueEx(key, "AutoUpdate")
-        if kind == winreg.REG_DWORD and value in (0, 1):
-            return bool(value)
-        raise ValueError("Invalid AutoUpdate value")
-
-
-def retire_legacy_setting():
+def retire_legacy_setting(path):
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, LEGACY_KEY, 0,
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0,
                             winreg.KEY_READ | winreg.KEY_SET_VALUE) as key:
             try:
                 winreg.DeleteValue(key, "AutoUpdate")
@@ -46,36 +38,8 @@ def retire_legacy_setting():
                 pass
             if winreg.QueryInfoKey(key)[:2] != (0, 0):
                 return
-        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, LEGACY_KEY)
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, path)
     except OSError:
-        pass
-
-
-def auto_update_enabled():
-    for path in (SETTINGS_KEY, LEGACY_KEY):
-        try:
-            return read_setting(path)
-        except (OSError, ValueError):
-            continue
-    return False
-
-
-def save_auto_update(enabled):
-    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, SETTINGS_KEY) as key:
-        winreg.SetValueEx(key, "AutoUpdate", 0, winreg.REG_DWORD, int(enabled))
-    if read_setting(SETTINGS_KEY) == bool(enabled):
-        retire_legacy_setting()
-
-
-def migrate_setting():
-    try:
-        old = read_setting(LEGACY_KEY)
-        try:
-            current = read_setting(SETTINGS_KEY)
-        except FileNotFoundError:
-            current = old
-        save_auto_update(current)
-    except (OSError, ValueError):
         pass
 
 
@@ -110,9 +74,61 @@ def cleanup_parts(folder):
         pass
 
 
-def initialize_storage():
+KNOWN_OLD_BUILDS = {
+    "cultivation_1.0.0.exe": "96092adc854bb8cabbf692e13dbf07bb809b4d35d80d4bc679b4f6398d014a11",
+    "cultivation_1.1.0.exe": "bb0ccdb336c25b9d887828c1ca9642e5400958bf68e21173dbb8074a3e60acad",
+    "cultivation_1.2.0.exe": "2960f33aa46144e7d73c191c12d2454604c6407417ea01a1e9b58c61c529047f",
+    "cultivation_1.3.0.exe": "95e2b806bddbfca04ab008e4318cda2f918c7d375456e2dd8e92fb5b508f4ce6",
+    "cultivation_1.3.1.exe": "e0947de24f43b1ad600b51e12fcb95b4bc0443790bb629310ea81872f308e547",
+    "cultivation_1.3.2.exe": "17104919150ddc3bb2f3365cc30c5a07c268b89b0b3b3622b514ed4d41c5a148",
+    "cultivation_1.4.0.exe": "f33af5c70994dc808be8980351a0ef2be9a63684396884f1b681014eef1b22a5",
+}
+
+
+def cleanup_old_builds(folder, running):
+    for name, digest in KNOWN_OLD_BUILDS.items():
+        path = folder / name
+        try:
+            if path != running and path.is_file() and not path.is_symlink() and file_hash(path) == digest:
+                path.unlink()
+        except OSError:
+            continue
+
+
+def cleanup_legacy_cache():
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        return
+    folder = Path(local) / "Cultivation" / "updates"
+    marker = folder / "installed.txt"
+    try:
+        if folder.resolve() != folder or not marker.is_file() or marker.stat().st_size > 256:
+            return
+        version, digest = marker.read_text().split()
+        if not re.fullmatch(SEMVER, version) or number(version) >= number(VERSION):
+            return
+        filename = f"cultivation_{version}.exe"
+        path = folder / filename
+        if KNOWN_OLD_BUILDS.get(filename) != digest or path.resolve() == Path(sys.executable).resolve():
+            return
+        if path.exists():
+            if file_hash(path) != digest:
+                return
+            path.unlink()
+        marker.unlink()
+        folder.rmdir()
+        folder.parent.rmdir()
+    except (ValueError, OSError):
+        pass
+
+
+def initialize_storage(updated=False):
     folder = Path(sys.executable).resolve().parent
-    migrate_setting()
+    for path in (LEGACY_KEY, SETTINGS_KEY):
+        retire_legacy_setting(path)
+    if updated:
+        cleanup_old_builds(folder, Path(sys.executable).resolve())
+    cleanup_legacy_cache()
     cleanup_parts(folder)
     atexit.register(cleanup_parts, folder)
 
@@ -245,7 +261,7 @@ def signal_ready(token):
         kernel.CloseHandle(wt.HANDLE(handle))
 
 
-def start_release(root, open_app):
+def start_release(root, open_app, asset=None, installed=None):
     import tkinter as tk
     from tkinter import ttk
     from time import monotonic
@@ -306,11 +322,11 @@ def start_release(root, open_app):
 
     show_track()
 
-    def proceed():
+    def proceed(available=None):
         cancelled.set()
         stop_track()
         panel.destroy()
-        open_app(root)
+        open_app(root, available)
 
     def close():
         cancelled.set()
@@ -351,17 +367,8 @@ def start_release(root, open_app):
             while True:
                 kind, value = messages.get_nowait()
                 if kind == "available":
-                    if value is None:
-                        proceed()
-                        return
-                    if auto_update_enabled():
-                        begin(value)
-                        continue
-                    stop_track()
-                    track.pack_forget()
-                    status.configure(text=f"有新版本 {value[0]} 可用（目前為 {VERSION}）")
-                    ttk.Button(actions, text="更新軟體", command=lambda asset=value: begin(asset)).pack(side="left")
-                    ttk.Button(actions, text="稍後", command=proceed).pack(side="left", padx=5)
+                    proceed(value)
+                    return
                 elif kind == "percent":
                     show_track(value)
                     status.configure(text=f"正在下載新版（{value}%）")
@@ -372,16 +379,19 @@ def start_release(root, open_app):
                     stop_track()
                     track.pack_forget()
                     status.configure(text=f"更新未完成：{value}")
-                    root.protocol("WM_DELETE_WINDOW", close)
+                    root.protocol("WM_DELETE_WINDOW", proceed)
                     ttk.Button(actions, text="繼續使用目前版本", command=proceed).pack()
                 else:
                     stop_track()
-                    root.destroy()
+                    installed()
                     return
         except Empty:
             if not cancelled.is_set():
                 root.after(100, poll)
 
     root.protocol("WM_DELETE_WINDOW", close)
-    Thread(target=check, daemon=True).start()
+    if asset is None:
+        Thread(target=check, daemon=True).start()
+    else:
+        begin(asset)
     poll()
