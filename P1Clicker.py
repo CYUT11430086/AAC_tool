@@ -235,7 +235,10 @@ SHOP_IMAGES = {
 STORE_FACE = Image.open((PICTURES / "store.png")).convert("RGB").crop((5, 4, 135, 64))
 
 
-def locate_store(frame):
+STORE_CURRENT = Image.open(PICTURES / "store_current.png").convert("RGB")
+
+
+def locate_store(frame, face=STORE_FACE):
     # Match the button face directly, even when its border touches the scenery.
     ratio = min(1.0, 1000 / frame.width)
     small = frame.resize((round(frame.width * ratio), round(frame.height * ratio)), Image.Resampling.BILINEAR)
@@ -243,10 +246,10 @@ def locate_store(frame):
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     best, point = .78, None
     for width in range(32, 162, 2):
-        height = round(width * STORE_FACE.height / STORE_FACE.width)
+        height = round(width * face.height / face.width)
         if width > small.width or height > small.height:
             continue
-        template = np.asarray(STORE_FACE.resize((width, height), Image.Resampling.BILINEAR))
+        template = np.asarray(face.resize((width, height), Image.Resampling.BILINEAR))
         scores = cv2.matchTemplate(gray, cv2.cvtColor(template, cv2.COLOR_RGB2GRAY), cv2.TM_CCOEFF_NORMED)
         _, score, _, (x, y) = cv2.minMaxLoc(scores)
         if score <= best:
@@ -303,7 +306,7 @@ def shop_button(frame, kind):
         if score > best:
             best, point = score, (x + w//2, y + h//2)
     if point is None:
-        return locate_store(frame) if store else upgrade_label(rgb, mask)
+        return (locate_store(frame) or locate_store(frame, STORE_CURRENT)) if store else upgrade_label(rgb, mask)
     return point
 
 

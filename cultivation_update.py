@@ -17,7 +17,7 @@ from threading import Event, Thread
 from queue import Empty, Queue
 from urllib.request import Request, urlopen
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 REPO = "CYUT11430086/AAC_tool"
 API = f"https://api.github.com/repos/{REPO}/releases/latest"
 SEMVER = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
